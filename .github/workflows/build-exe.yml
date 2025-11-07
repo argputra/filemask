@@ -1,4 +1,4 @@
-name: Build Executable for Windows
+name: Build Executable for Windows (Fast Startup)
 
 on:
   push:
@@ -7,7 +7,6 @@ on:
 
 jobs:
   build-windows:
-    # ✅ Sudah benar untuk Windows
     runs-on: windows-latest 
     steps:
     - name: 🔄 Checkout repository
@@ -22,15 +21,19 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        # PERBAIKAN: Menggunakan sintaks PowerShell yang benar (Test-Path)
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-    - name: 🛠️ Build EXE with PyInstaller
+    - name: 🛠️ Build EXE with PyInstaller (Using --onedir)
       run: |
-        pyinstaller --onefile --console filemask.py
+        # 🚨 PERUBAHAN UTAMA: Menggunakan --onedir untuk startup yang cepat
+        # Ini akan membuat folder 'filemask' di dalam dist/
+        pyinstaller --onedir --console filemask.py
 
-    - name: 📤 Upload EXE artifact
+    - name: 📤 Upload 'OneDir' Artifact Folder
       uses: actions/upload-artifact@v4 
       with:
-        name: filemask-windows-exe
-        path: dist/filemask.exe
+        # Nama artifact diubah untuk mencerminkan bahwa ini adalah folder
+        name: filemask-onedir-bundle 
+        # Path diubah untuk mengunggah seluruh folder yang dibuat oleh PyInstaller
+        # Nama foldernya sama dengan nama script (filemask)
+        path: dist/filemask
