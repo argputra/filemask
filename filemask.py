@@ -256,6 +256,12 @@ def main():
                         help="[Mode multi-file] Folder tujuan output. Jika kosong, output di folder asal tiap file.")
     parser.add_argument('--ext', nargs='+', default=None,
                         help="Batasi ekstensi file yang diproses. Contoh: --ext .txt .sql atau txt sql")
+    parser.add_argument('--encoding', default=None,
+                        help="Paksa encoding input (mis: utf-8, latin-1, utf-16). Jika tidak ditentukan akan pakai utf-8 atau auto jika --auto-encoding.")
+    parser.add_argument('--auto-encoding', action='store_true',
+                        help="Aktifkan deteksi encoding otomatis (BOM + fallback percobaan). Mengabaikan error decode utf-8.")
+    parser.add_argument('--force-output-utf8', action='store_true',
+                        help="Selalu tulis output sebagai UTF-8 meskipun input encoding berbeda.")
 
     # Opsi progress bar di terminal
     parser.add_argument('--progress', action='store_true', help='Tampilkan progress bar saat memproses')
@@ -486,15 +492,52 @@ def main():
     print("INFO: Memulai proses masking...")
     processed_files = 0
     for file_index, input_fp in enumerate(input_files, start=1):
-        # 3.1 Baca file input
+        # 3.1 Baca file input dengan dukungan auto-encoding
+        def detect_encoding(data: bytes) -> str:
+            # BOM detection
+            if data.startswith(b'\xff\xfe'):
+                return 'utf-16-le'
+            if data.startswith(b'\xfe\xff'):
+                return 'utf-16-be'
+            if data.startswith(b'\xef\xbb\xbf'):
+                return 'utf-8-sig'
+            # heuristic fallback attempts
+            for enc in ('utf-8', 'utf-16', 'latin-1'):
+                try:
+                    data.decode(enc)
+                    return enc
+                except Exception:
+                    pass
+            return 'latin-1'
+
+        chosen_encoding = 'utf-8'
+        raw_bytes = b''
         try:
-            with open(input_fp, 'r', encoding='utf-8') as f:
-                input_content = f.read()
+            with open(input_fp, 'rb') as bf:
+                raw_bytes = bf.read()
+            if args.encoding:
+                chosen_encoding = args.encoding
+            elif args.auto_encoding:
+                chosen_encoding = detect_encoding(raw_bytes)
+            # Decode dengan chosen_encoding + fallback latin-1 jika gagal
+            try:
+                input_content = raw_bytes.decode(chosen_encoding)
+            except UnicodeDecodeError as ue:
+                if not args.auto_encoding and not args.encoding:
+                    # Coba latin-1
+                    try:
+                        input_content = raw_bytes.decode('latin-1')
+                        chosen_encoding = 'latin-1'
+                        print(f"WARNING: Decode utf-8 gagal untuk '{input_fp}' ({ue}). Fallback ke latin-1.")
+                    except Exception:
+                        raise
+                else:
+                    print(f"ERROR: Gagal decode dengan encoding '{chosen_encoding}' untuk '{input_fp}': {ue}")
+                    raise
             masked_content_lines = input_content.splitlines()
-            print(f"INFO: ({file_index}/{len(input_files)}) Memuat '{input_fp}' ({len(masked_content_lines)} baris)")
+            print(f"INFO: ({file_index}/{len(input_files)}) Memuat '{input_fp}' ({len(masked_content_lines)} baris, encoding={chosen_encoding})")
         except Exception as e:
             print(f"ERROR: Gagal membaca '{input_fp}': {e}")
-            # Lanjutkan ke file berikutnya
             if files_progress_cb:
                 files_progress_cb(file_index, len(input_files))
             continue
@@ -544,7 +587,8 @@ def main():
                 output_fp = os.path.join(out_dir, f"{base}_masked{ext}")
 
             final_masked_content = '\n'.join(masked_content_lines)
-            with open(output_fp, 'w', encoding='utf-8') as f:
+            out_encoding = 'utf-8' if args.force_output_utf8 else chosen_encoding
+            with open(output_fp, 'w', encoding=out_encoding) as f:
                 f.write(final_masked_content)
             print(f"SUCCESS: ({file_index}/{len(input_files)}) Tersimpan: '{output_fp}' | Karakter dimasking: {file_masked_count}")
             grand_total_masked += file_masked_count
