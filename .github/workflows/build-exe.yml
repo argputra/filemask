@@ -1,13 +1,13 @@
 name: Build Windows EXE for filemask
 
 on:
-workflow_dispatch:
-push:
-branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-build-windows:
-runs-on: windows-latest
+  build-windows:
+    runs-on: windows-latest
 
 steps:
   - name: Checkout repository
