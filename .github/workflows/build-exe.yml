@@ -14,7 +14,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: 🐍 Set up Python 3.11
-      uses: actions/setup-python@v5 # Diperbarui ke v5
+      uses: actions/setup-python@v5 
       with:
         python-version: '3.11'
 
@@ -22,14 +22,15 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        if exist requirements.txt (pip install -r requirements.txt) # Sintaks Windows (PowerShell)
+        # PERBAIKAN: Menggunakan sintaks PowerShell yang benar (Test-Path)
+        if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
     - name: 🛠️ Build EXE with PyInstaller
       run: |
         pyinstaller --onefile --console filemask.py
 
     - name: 📤 Upload EXE artifact
-      uses: actions/upload-artifact@v4 # Diperbarui ke v4
+      uses: actions/upload-artifact@v4 
       with:
         name: filemask-windows-exe
         path: dist/filemask.exe
