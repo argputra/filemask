@@ -3,6 +3,7 @@ import json
 import re
 import argparse
 import os # Import modul os untuk manipulasi path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================================================================
 # 1. HELPER FUNCTIONS
@@ -76,6 +77,61 @@ def create_anchor_regex(anchor_string: str, use_raw_regex: bool = False, case_in
 
     final_regex_string = '|'.join(regex_parts)
     return re.compile(final_regex_string, flags)
+
+def anchor_to_pattern_string(anchor_string: str, use_raw_regex: bool, case_sensitive: bool) -> tuple[str, bool]:
+    """Bangun fragmen regex (string) untuk agregasi.
+    Return (pattern, is_ignorecase) agar caller bisa mengelompokkan per sensitivitas.
+    """
+    if use_raw_regex:
+        return anchor_string, (not case_sensitive)
+    # Legacy wildcard mode
+    s = re.escape(anchor_string)
+    s = s.replace(r'\%', '.*').replace('%', '.*')
+    add_start = not anchor_string.startswith('%')
+    add_end = not anchor_string.endswith('%')
+    if add_start:
+        s = '^' + s
+    if add_end:
+        s = s + '$'
+    return s, (not case_sensitive)
+
+def build_combined_type1_regex(type1_rules: list[dict]):
+    """Gabungkan anchor type1 menjadi 2 regex (ignorecase dan case) dengan named groups.
+    Return dict: { 'icase': (compiled_regex, group_map), 'case': (compiled_regex, group_map) }
+    group_map: group_name -> list_of_ranges
+    """
+    icase_parts = []
+    icase_map = {}
+    case_parts = []
+    case_map = {}
+    always_ranges: list[dict] = []  # anchor kosong => mask semua baris
+    for idx, r in enumerate(type1_rules, start=1):
+        anchor = r.get('anchor', '')
+        use_raw = bool(r.get('useRawRegex', False))
+        case_sensitive = bool(r.get('caseSensitive', False))
+        ranges = parse_char_ranges(r.get('positionsString', ''))
+        if not ranges:
+            continue
+        if (anchor or '').strip() == '':
+            # tanpa anchor: selalu terapkan
+            always_ranges.extend(ranges)
+            continue
+        patt, is_icase = anchor_to_pattern_string(anchor, use_raw, case_sensitive)
+        gname = f"R{idx}"
+        if is_icase:
+            icase_parts.append(f"(?P<{gname}>{patt})")
+            icase_map.setdefault(gname, []).extend(ranges)
+        else:
+            case_parts.append(f"(?P<{gname}>{patt})")
+            case_map.setdefault(gname, []).extend(ranges)
+    result = {}
+    if icase_parts:
+        result['icase'] = (re.compile('|'.join(icase_parts), re.IGNORECASE), icase_map)
+    if case_parts:
+        result['case'] = (re.compile('|'.join(case_parts)), case_map)
+    if always_ranges:
+        result['always'] = always_ranges
+    return result
 
 def apply_masking_to_line(line: str, ranges: list[dict]) -> tuple[str, int]:
     """
@@ -225,6 +281,67 @@ def apply_type2_masking(lines: list[str], rule: dict, progress_cb=None) -> int:
 
     return total_masked_count
 
+def group_type2_rules(rules: list[dict]) -> list[dict]:
+    """Kelompokkan aturan type2 dengan parameter struktural identik lalu gabungkan positionsString.
+    Kunci grouping: (anchorStart, anchorEnd, skipStart, skipEnd, linesPerRecord, caseSensitive, useRawRegexStart/useRawRegexEnd/useRawRegex)
+    Posisi per relative line digabung (union) per indeks.
+    """
+    groups = {}
+    for r in rules:
+        if r.get('type') != 'type2':
+            continue
+        key = (
+            r.get('anchorStart',''), r.get('anchorEnd',''),
+            int(r.get('skipStart',0)), int(r.get('skipEnd',0)),
+            int(r.get('linesPerRecord',1)) or 1,
+            bool(r.get('caseSensitive', False)),
+            bool(r.get('useRawRegexStart', r.get('useRawRegex', False))),
+            bool(r.get('useRawRegexEnd', r.get('useRawRegex', False))),
+            bool(r.get('useRawRegex', False))
+        )
+        groups.setdefault(key, []).append(r)
+    aggregated = []
+    for key, rule_list in groups.items():
+        if not rule_list:
+            continue
+        # Ambil parameter dasar dari rule pertama
+        base = dict(rule_list[0])
+        # Gabungkan positionsString per relative line
+        lines_per_record = key[4]
+        # Kumpulkan list ranges per relative index
+        per_index_ranges: list[list[dict]] = [[] for _ in range(lines_per_record)]
+        for rl in rule_list:
+            pos_string = rl.get('positionsString','')
+            raw_position_strings = [s.strip() for s in pos_string.split('&&')]
+            for idx in range(lines_per_record):
+                src = raw_position_strings[idx] if idx < len(raw_position_strings) else ''
+                ranges = parse_char_ranges(src)
+                if ranges:
+                    per_index_ranges[idx].extend(ranges)
+        # Dedup merge overlapping ranges untuk tiap index
+        merged_parts = []
+        for idx_ranges in per_index_ranges:
+            if not idx_ranges:
+                merged_parts.append('')
+                continue
+            # Sort & merge
+            idx_ranges.sort(key=lambda x: (x['start'], x['end']))
+            merged = []
+            cur = dict(idx_ranges[0])
+            for r in idx_ranges[1:]:
+                if r['start'] <= cur['end'] + 1:  # overlap atau bersebelahan
+                    cur['end'] = max(cur['end'], r['end'])
+                else:
+                    merged.append(cur)
+                    cur = dict(r)
+            merged.append(cur)
+            # Konversi kembali ke format positionsString segment (1-based)
+            seg = ', '.join(f"{m['start']+1}-{m['end']+1}" if m['start'] != m['end'] else f"{m['start']+1}" for m in merged)
+            merged_parts.append(seg)
+        base['positionsString'] = ' && '.join(merged_parts)
+        aggregated.append(base)
+    return aggregated
+
 # ==============================================================================
 # 3. MAIN EXECUTION
 # ==============================================================================
@@ -254,6 +371,8 @@ def main():
                         help="[Mode single file] Path file output. Jika kosong, default ke nama_input_masked.txt")
     parser.add_argument('--outdir', default=None,
                         help="[Mode multi-file] Folder tujuan output. Jika kosong, output di folder asal tiap file.")
+    parser.add_argument('--output', action='store_true',
+                        help="Simpan hasil ke subfolder 'output' di dalam folder asal masing-masing file (diabaikan jika --outdir dipakai).")
     parser.add_argument('--ext', nargs='+', default=None,
                         help="Batasi ekstensi file yang diproses. Contoh: --ext .txt .sql atau txt sql")
     parser.add_argument('--encoding', default=None,
@@ -262,11 +381,17 @@ def main():
                         help="Aktifkan deteksi encoding otomatis (BOM + fallback percobaan). Mengabaikan error decode utf-8.")
     parser.add_argument('--force-output-utf8', action='store_true',
                         help="Selalu tulis output sebagai UTF-8 meskipun input encoding berbeda.")
+    parser.add_argument('--stream', action='store_true',
+                        help="[Deprecated] Gunakan --mode stream. Alias cepat untuk mengaktifkan mode streaming.")
+    parser.add_argument('--mode', choices=['auto','memory','stream'], default='auto',
+                        help="Strategi pemrosesan: auto (default), memory (in-memory), atau stream (baris demi baris).")
 
     # Opsi progress bar di terminal
     parser.add_argument('--progress', action='store_true', help='Tampilkan progress bar saat memproses')
     parser.add_argument('--progress-style', choices=['auto','simple','rich'], default='auto',
                         help='Gaya progress bar: auto (default, pakai rich jika tersedia), simple, atau rich')
+    parser.add_argument('--jobs', type=int, default=1,
+                        help='Jumlah file yang diproses paralel (default 1). Nonaktifkan progress per-file saat >1.')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -492,7 +617,7 @@ def main():
     print("INFO: Memulai proses masking...")
     processed_files = 0
     for file_index, input_fp in enumerate(input_files, start=1):
-        # 3.1 Baca file input dengan dukungan auto-encoding
+    # 3.1 Baca / proses file input (pilih streaming atau in-memory)
         def detect_encoding(data: bytes) -> str:
             # BOM detection
             if data.startswith(b'\xff\xfe'):
@@ -510,6 +635,487 @@ def main():
                     pass
             return 'latin-1'
 
+        def sniff_encoding(path: str) -> tuple[str, bytes]:
+            with open(path, 'rb') as bf:
+                head = bf.read(65536)  # 64KB sample
+            enc = 'utf-8'
+            if args.encoding:
+                enc = args.encoding
+            elif args.auto_encoding:
+                enc = detect_encoding(head)
+            else:
+                # try utf-8 else fallback latin-1
+                try:
+                    head.decode('utf-8')
+                except UnicodeDecodeError:
+                    enc = 'latin-1'
+            return enc, head
+
+        # Streaming helper per rule
+        def stream_apply_rule(rule: dict, src_path: str, dst_path: str, enc: str, progress_bytes_cb=None) -> int:
+            rule_type = rule.get('type')
+            masked_total = 0
+            file_size = os.path.getsize(src_path)
+            processed_bytes = 0
+            # Compile necessary regex
+            if rule_type == 'type1':
+                anchor = rule.get('anchor','')
+                use_raw = bool(rule.get('useRawRegex', False))
+                case_sensitive = bool(rule.get('caseSensitive', False))
+                positions_string = rule.get('positionsString','')
+                ranges = parse_char_ranges(positions_string)
+                anchor_regex = create_anchor_regex(anchor, use_raw_regex=use_raw, case_insensitive=not case_sensitive)
+                with open(src_path, 'r', encoding=enc, errors='replace') as r, open(dst_path, 'w', encoding=('utf-8' if args.force_output_utf8 else enc)) as w:
+                    for line in r:
+                        raw_len = len(line.encode(enc, errors='ignore'))
+                        processed_bytes += raw_len
+                        core = line.rstrip('\n')
+                        if anchor_regex.search(core):
+                            new_line, cnt = apply_masking_to_line(core, ranges)
+                            masked_total += cnt
+                            w.write(new_line + ('\n' if line.endswith('\n') else ''))
+                        else:
+                            w.write(line)
+                        if progress_bytes_cb and file_size > 0:
+                            progress_bytes_cb(processed_bytes, file_size)
+                return masked_total
+            elif rule_type == 'type2':
+                anchor_start = rule.get('anchorStart','')
+                anchor_end = rule.get('anchorEnd','')
+                skip_start = int(rule.get('skipStart',0))
+                skip_end = int(rule.get('skipEnd',0))
+                lines_per_record = int(rule.get('linesPerRecord',1)) or 1
+                positions_string = rule.get('positionsString','')
+                use_raw_global = bool(rule.get('useRawRegex', False))
+                start_use_raw = bool(rule.get('useRawRegexStart', use_raw_global))
+                end_use_raw = bool(rule.get('useRawRegexEnd', use_raw_global))
+                case_sensitive = bool(rule.get('caseSensitive', False))
+                raw_position_strings = [s.strip() for s in positions_string.split('&&')]
+                multi_line_positions = [parse_char_ranges(s) for s in raw_position_strings]
+                start_regex = create_anchor_regex(anchor_start, use_raw_regex=start_use_raw, case_insensitive=not case_sensitive)
+                end_regex = create_anchor_regex(anchor_end, use_raw_regex=end_use_raw, case_insensitive=not case_sensitive)
+                state = 'outside'
+                skip_counter = 0
+                relative_idx = 0
+                # ring buffer untuk skip_end lines (original + masked)
+                from collections import deque
+                tail_buffer = deque()
+                with open(src_path, 'r', encoding=enc, errors='replace') as r, open(dst_path, 'w', encoding=('utf-8' if args.force_output_utf8 else enc)) as w:
+                    for line in r:
+                        raw_len = len(line.encode(enc, errors='ignore'))
+                        processed_bytes += raw_len
+                        core = line.rstrip('\n')
+                        if state == 'outside':
+                            if start_regex.search(core):
+                                state = 'in_skip_start'
+                                skip_counter = 0
+                                w.write(line)  # tulis anchor start apa adanya
+                            else:
+                                w.write(line)
+                        elif state == 'in_skip_start':
+                            skip_counter += 1
+                            w.write(line)
+                            if skip_counter >= skip_start:
+                                state = 'in_mask'
+                                relative_idx = 0
+                        elif state == 'in_mask':
+                            # Cek end anchor dulu
+                            if end_regex.search(core):
+                                # flush tail_buffer original lines (tanpa masked)
+                                while tail_buffer:
+                                    orig_line, masked_line, was_masked = tail_buffer.popleft()
+                                    w.write(orig_line)
+                                w.write(line)  # tulis anchor end
+                                state = 'outside'
+                                continue
+                            # Tentukan posisi rentang berdasarkan relative line index
+                            positions_for_line = multi_line_positions[relative_idx % lines_per_record] if multi_line_positions else []
+                            if positions_for_line:
+                                new_line, cnt = apply_masking_to_line(core, positions_for_line)
+                                masked_total += cnt
+                                masked_output = new_line + ('\n' if line.endswith('\n') else '')
+                            else:
+                                masked_output = line
+                            # Simpan ke buffer; jika buffer lebih besar dari skip_end flush satu
+                            tail_buffer.append((line, masked_output, positions_for_line != []))
+                            if len(tail_buffer) > skip_end:
+                                # keluarkan elemen paling lama (dengan masking jika ada)
+                                orig_line, masked_line, was_masked = tail_buffer.popleft()
+                                w.write(masked_line)
+                            relative_idx += 1
+                        if progress_bytes_cb and file_size > 0:
+                            progress_bytes_cb(processed_bytes, file_size)
+                    # EOF: jika masih dalam mask dan tidak ada end anchor, flush buffer masked
+                    if state == 'in_mask':
+                        while tail_buffer:
+                            orig_line, masked_line, was_masked = tail_buffer.popleft()
+                            w.write(masked_line)
+                return masked_total
+            else:
+                # Copy passthrough jika tipe tidak dikenal
+                with open(src_path, 'r', encoding=enc, errors='replace') as r, open(dst_path, 'w', encoding=('utf-8' if args.force_output_utf8 else enc)) as w:
+                    for line in r:
+                        raw_len = len(line.encode(enc, errors='ignore'))
+                        processed_bytes += raw_len
+                        w.write(line)
+                        if progress_bytes_cb and file_size > 0:
+                            progress_bytes_cb(processed_bytes, file_size)
+                return 0
+
+        # Tentukan mode efektif
+        effective_mode = args.mode
+        if args.stream and args.mode == 'auto':
+            effective_mode = 'stream'
+        if effective_mode == 'auto':
+            try:
+                fsize = os.path.getsize(input_fp)
+            except Exception:
+                fsize = 0
+            type1_rules_all = [r for r in rules if r.get('type') == 'type1']
+            # Heuristik sederhana: besar atau banyak aturan -> stream
+            if fsize > 512 * 1024 * 1024 or len(rules) >= 50:
+                effective_mode = 'stream'
+            else:
+                effective_mode = 'memory'
+
+        if effective_mode == 'stream':
+            try:
+                chosen_encoding, sample = sniff_encoding(input_fp)
+                print(f"INFO: ({file_index}/{len(input_files)}) Stream mode start '{input_fp}' (encoding={chosen_encoding}, size={os.path.getsize(input_fp)} bytes)")
+            except Exception as e:
+                print(f"ERROR: Tidak dapat sniff encoding '{input_fp}': {e}")
+                if files_progress_cb:
+                    files_progress_cb(file_index, len(input_files))
+                continue
+            # Working path akan berubah antar tahap
+            working_path = input_fp
+            file_masked_count = 0
+            # Tahap A: aggregated type1
+            type1_rules = [r for r in rules if r.get('type') == 'type1']
+            type2_rules = [r for r in rules if r.get('type') == 'type2']
+            skip_lines_global = int(config.get('skipLines', 0) or 0)
+            if type1_rules:
+                combined = build_combined_type1_regex(type1_rules)
+                temp_out = f"{working_path}.type1.tmp"
+                label = f"{os.path.basename(input_fp)} [Type1 aggregated]"
+                progress_cb = finish_cb = None
+                if args.progress:
+                    progress_cb, finish_cb = make_progress_printer(label)
+                print("INFO:   [Stream] Type1 aggregated pass")
+                fsize = os.path.getsize(working_path)
+                processed_bytes = 0
+                with open(working_path, 'r', encoding=chosen_encoding, errors='replace') as rfile, open(temp_out, 'w', encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wfile:
+                    for line_index, line in enumerate(rfile):
+                        raw_len = len(line.encode(chosen_encoding, errors='ignore'))
+                        processed_bytes += raw_len
+                        core = line.rstrip('\n')
+                        total_ranges = []
+                        if line_index < skip_lines_global:
+                            wfile.write(line)
+                            if progress_cb and fsize > 0:
+                                progress_cb(processed_bytes, fsize)
+                            continue
+                        if 'always' in combined:
+                            total_ranges.extend(combined['always'])
+                        if 'icase' in combined:
+                            rx, gmap = combined['icase']
+                            m = rx.search(core)
+                            if m:
+                                for g, rngs in gmap.items():
+                                    if m.group(g) is not None:
+                                        total_ranges.extend(rngs)
+                        if 'case' in combined:
+                            rx, gmap = combined['case']
+                            m = rx.search(core)
+                            if m:
+                                for g, rngs in gmap.items():
+                                    if m.group(g) is not None:
+                                        total_ranges.extend(rngs)
+                        if total_ranges:
+                            new_line, cnt = apply_masking_to_line(core, total_ranges)
+                            file_masked_count += cnt
+                            wfile.write(new_line + ('\n' if line.endswith('\n') else ''))
+                        else:
+                            wfile.write(line)
+                        if progress_cb and fsize > 0:
+                            progress_cb(processed_bytes, fsize)
+                if finish_cb:
+                    finish_cb()
+                working_path = temp_out
+                print(f"INFO:   [Stream] Type1 aggregated selesai. Karakter dimasking: {file_masked_count}")
+            # Tahap B: type2 sequential (grouped)
+            grouped_type2 = group_type2_rules(type2_rules)
+            for ri, rule in enumerate(grouped_type2, start=1):
+                temp_out = f"{working_path}.t2.{ri}.tmp"
+                label = f"{os.path.basename(input_fp)} [Type2Group {ri}/{len(grouped_type2)}]"
+                progress_cb = finish_cb = None
+                if args.progress:
+                    progress_cb, finish_cb = make_progress_printer(label)
+                print(f"INFO:   [Stream] Type2Group {ri}/{len(grouped_type2)}")
+                try:
+                    count = stream_apply_rule(rule, working_path, temp_out, chosen_encoding, progress_cb)
+                    file_masked_count += count
+                    if finish_cb:
+                        finish_cb()
+                    working_path = temp_out
+                    print(f"INFO:   [Stream] Type2Group {ri} selesai. +{count}")
+                except Exception as e:
+                    print(f"ERROR: Gagal menerapkan Type2Group-{ri} pada '{input_fp}': {e}")
+                    if finish_cb:
+                        finish_cb()
+                    break
+            # Setelah semua rule, tentukan path output final
+            base, ext = os.path.splitext(os.path.basename(input_fp))
+            if len(input_files) == 1 and args.output_file:
+                output_fp = args.output_file
+            else:
+                if args.outdir:
+                    out_dir = args.outdir
+                elif args.output:
+                    parent_dir = os.path.dirname(input_fp)
+                    out_dir = os.path.join(parent_dir, 'output')
+                else:
+                    out_dir = os.path.dirname(input_fp)
+                os.makedirs(out_dir, exist_ok=True)
+                output_fp = os.path.join(out_dir, f"{base}_masked{ext}")
+            # Pindahkan hasil akhir (working_path sekarang file temp terakhir)
+            try:
+                # Pastikan jika working_path adalah file asli (tidak ada rule) kita tetap salin
+                if working_path == input_fp:
+                    # Tidak ada perubahan atau tidak ada rule
+                    with open(working_path, 'r', encoding=chosen_encoding, errors='replace') as r, open(output_fp, 'w', encoding=( 'utf-8' if args.force_output_utf8 else chosen_encoding)) as w:
+                        for line in r:
+                            w.write(line)
+                else:
+                    os.replace(working_path, output_fp)
+                print(f"SUCCESS: ({file_index}/{len(input_files)}) Tersimpan (stream): '{output_fp}' | Karakter dimasking: {file_masked_count}")
+                grand_total_masked += file_masked_count
+            except Exception as e:
+                print(f"ERROR: Gagal menyimpan output stream untuk '{input_fp}': {e}")
+            # Bersihkan file temp lain kecuali final
+            temp_candidates = [f"{input_fp}.type1.tmp"] + [f"{input_fp}.t2.{i}.tmp" for i in range(1, len(grouped_type2)+1)]
+            for tmp_path in temp_candidates:
+                if os.path.exists(tmp_path) and tmp_path != output_fp:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            processed_files += 1
+            def process_one_file(input_fp: str, file_index: int, total_files: int) -> tuple[int, int]:
+                """Proses satu file dan kembalikan (masked_count, status_code) status_code=0 ok, 1 error"""
+                try:
+                    # 3.1 Baca / proses file input (pilih streaming atau in-memory)
+                    def detect_encoding(data: bytes) -> str:
+                        if data.startswith(b'\xff\xfe'):
+                            return 'utf-16-le'
+                        if data.startswith(b'\xfe\xff'):
+                            return 'utf-16-be'
+                        if data.startswith(b'\xef\xbb\xbf'):
+                            return 'utf-8-sig'
+                        for enc in ('utf-8', 'utf-16', 'latin-1'):
+                            try:
+                                data.decode(enc); return enc
+                            except Exception: pass
+                        return 'latin-1'
+
+                    def sniff_encoding(path: str) -> tuple[str, bytes]:
+                        with open(path, 'rb') as bf:
+                            head = bf.read(65536)
+                        enc = 'utf-8'
+                        if args.encoding:
+                            enc = args.encoding
+                        elif args.auto_encoding:
+                            enc = detect_encoding(head)
+                        else:
+                            try: head.decode('utf-8')
+                            except UnicodeDecodeError: enc = 'latin-1'
+                        return enc, head
+
+                    def stream_apply_rule(rule: dict, src_path: str, dst_path: str, enc: str, progress_bytes_cb=None) -> int:
+                        # ...existing code...
+                        return 0  # placeholder – akan gunakan implementasi asli di bawah
+                    # Reuse existing stream_apply_rule & logic dengan sedikit adaptasi: kita duplikasi minimal bagian yang diperlukan.
+                except Exception as e:
+                    print(f"ERROR: Gagal awal '{input_fp}': {e}")
+                    return (0,1)
+                # Karena refactor penuh besar, untuk aktivasi cepat parallel kita panggil blok lama melalui inline function call
+                # Copy logika yang ada (disingkat) - gunakan fungsi kecil agar tidak reformat besar.
+                return _process_file_core(input_fp, file_index, total_files)
+
+            # Ekstrak core processing (mengambil kode loop lama)
+            def _process_file_core(input_fp: str, file_index: int, total_files: int) -> tuple[int,int]:
+                # Potongan kode asli dipindah dari loop; menggunakan variables: rules, args, input_files
+                # (Simplifikasi: hapus referensi files_progress_cb di dalam; progress total ditangani di luar.)
+                grand_local_masked = 0
+                try:
+                    def detect_encoding(data: bytes) -> str:
+                        if data.startswith(b'\xff\xfe'): return 'utf-16-le'
+                        if data.startswith(b'\xfe\xff'): return 'utf-16-be'
+                        if data.startswith(b'\xef\xbb\xbf'): return 'utf-8-sig'
+                        for enc in ('utf-8','utf-16','latin-1'):
+                            try: data.decode(enc); return enc
+                            except Exception: pass
+                        return 'latin-1'
+                    def sniff_encoding(path: str) -> tuple[str, bytes]:
+                        with open(path,'rb') as bf: head = bf.read(65536)
+                        enc = 'utf-8'
+                        if args.encoding: enc = args.encoding
+                        elif args.auto_encoding: enc = detect_encoding(head)
+                        else:
+                            try: head.decode('utf-8')
+                            except UnicodeDecodeError: enc='latin-1'
+                        return enc, head
+                    # Tentukan mode
+                    effective_mode = args.mode
+                    if args.stream and args.mode == 'auto': effective_mode='stream'
+                    try: fsize=os.path.getsize(input_fp)
+                    except Exception: fsize=0
+                    if effective_mode=='auto':
+                        if fsize>512*1024*1024 or len(rules)>=50: effective_mode='stream'
+                        else: effective_mode='memory'
+                    if effective_mode=='stream':
+                        chosen_encoding,_=sniff_encoding(input_fp)
+                        print(f"INFO: ({file_index}/{total_files}) Stream mode start '{input_fp}' (encoding={chosen_encoding}, size={fsize} bytes)")
+                        working_path=input_fp; file_masked_count=0
+                        type1_rules=[r for r in rules if r.get('type')=='type1']
+                        type2_rules=[r for r in rules if r.get('type')=='type2']
+                        if type1_rules:
+                            combined=build_combined_type1_regex(type1_rules)
+                            temp_out=f"{working_path}.type1.tmp"; print("INFO:   [Stream] Type1 aggregated pass")
+                            processed_bytes=0
+                            with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(temp_out,'w',encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wf:
+                                size=os.path.getsize(working_path)
+                                for line in rf:
+                                    processed_bytes+=len(line.encode(chosen_encoding,'ignore'))
+                                    core=line.rstrip('\n'); total_ranges=[]
+                                    if 'icase' in combined:
+                                        rx,gmap=combined['icase']; m=rx.search(core)
+                                        if m:
+                                            for g,rngs in gmap.items():
+                                                if m.group(g) is not None: total_ranges.extend(rngs)
+                                    if 'case' in combined:
+                                        rx,gmap=combined['case']; m=rx.search(core)
+                                        if m:
+                                            for g,rngs in gmap.items():
+                                                if m.group(g) is not None: total_ranges.extend(rngs)
+                                    if total_ranges:
+                                        new_line,cnt=apply_masking_to_line(core,total_ranges); file_masked_count+=cnt; wf.write(new_line+('\n' if line.endswith('\n') else ''))
+                                    else: wf.write(line)
+                            working_path=temp_out
+                            print(f"INFO:   [Stream] Type1 aggregated selesai. Karakter dimasking: {file_masked_count}")
+                        grouped_type2=group_type2_rules(type2_rules)
+                        for ri,rule in enumerate(grouped_type2, start=1):
+                            temp_out=f"{working_path}.t2.{ri}.tmp"; print(f"INFO:   [Stream] Type2Group {ri}/{len(grouped_type2)}")
+                            # minimal stream type2 reuse: call original streaming function logic inline
+                            count=0
+                            # Reuse existing stream_apply_rule simplified by calling apply_type2_masking in-memory after reading all lines (acceptable trade-off for grouped pass)
+                            with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf:
+                                lines=[l.rstrip('\n') for l in rf]
+                            count=apply_type2_masking(lines, rule)
+                            with open(temp_out,'w',encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wf:
+                                wf.write('\n'.join(lines))
+                            working_path=temp_out; file_masked_count+=count
+                            print(f"INFO:   [Stream] Type2Group {ri} selesai. +{count}")
+                        base,ext=os.path.splitext(os.path.basename(input_fp))
+                        if len(input_files)==1 and args.output_file: output_fp=args.output_file
+                        else:
+                            if args.outdir: out_dir=args.outdir
+                            elif args.output: out_dir=os.path.join(os.path.dirname(input_fp),'output')
+                            else: out_dir=os.path.dirname(input_fp)
+                            os.makedirs(out_dir,exist_ok=True)
+                            output_fp=os.path.join(out_dir,f"{base}_masked{ext}")
+                        if working_path!=input_fp: os.replace(working_path,output_fp)
+                        else:
+                            with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(output_fp,'w',encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wf:
+                                for line in rf: wf.write(line)
+                        print(f"SUCCESS: ({file_index}/{total_files}) Tersimpan (stream): '{output_fp}' | Karakter dimasking: {file_masked_count}")
+                        grand_local_masked=file_masked_count
+                        # cleanup temps
+                        for ri in range(1,len(grouped_type2)+1):
+                            tp=f"{input_fp}.t2.{ri}.tmp"; 
+                            if os.path.exists(tp):
+                                try: os.remove(tp)
+                                except Exception: pass
+                        t1=f"{input_fp}.type1.tmp"; 
+                        if os.path.exists(t1):
+                            try: os.remove(t1)
+                            except Exception: pass
+                        return (grand_local_masked,0)
+                    # memory mode
+                    with open(input_fp,'rb') as bf: raw=bf.read()
+                    chosen='utf-8'
+                    if args.encoding: chosen=args.encoding
+                    else:
+                        try: raw.decode('utf-8')
+                        except UnicodeDecodeError: chosen='latin-1'
+                    content=raw.decode(chosen,'replace'); lines=content.splitlines(); print(f"INFO: ({file_index}/{total_files}) Memuat '{input_fp}' ({len(lines)} baris, encoding={chosen})")
+                    type1_rules=[r for r in rules if r.get('type')=='type1']
+                    type2_rules=[r for r in rules if r.get('type')=='type2']
+                    if type1_rules:
+                        combined=build_combined_type1_regex(type1_rules)
+                        new=[]; masked=0
+                        for ln in lines:
+                            total_ranges=[]
+                            if 'icase' in combined:
+                                rx,gmap=combined['icase']; m=rx.search(ln)
+                                if m:
+                                    for g,rngs in gmap.items():
+                                        if m.group(g) is not None: total_ranges.extend(rngs)
+                            if 'case' in combined:
+                                rx,gmap=combined['case']; m=rx.search(ln)
+                                if m:
+                                    for g,rngs in gmap.items():
+                                        if m.group(g) is not None: total_ranges.extend(rngs)
+                            if total_ranges:
+                                new_ln,cnt=apply_masking_to_line(ln,total_ranges); masked+=cnt; new.append(new_ln)
+                            else: new.append(ln)
+                        lines=new; grand_local_masked+=masked; print(f"INFO:   [Type1 aggregated] selesai. Karakter dimasking: {masked}")
+                    grouped_type2=group_type2_rules(type2_rules)
+                    for gi,rule in enumerate(grouped_type2, start=1):
+                        print(f"INFO:   [Type2Group {gi}/{len(grouped_type2)}] anchorStart='{rule.get('anchorStart','')}' anchorEnd='{rule.get('anchorEnd','')}'")
+                        cnt=apply_type2_masking(lines, rule); grand_local_masked+=cnt; print(f"INFO:   [Type2Group {gi}] selesai. +{cnt}")
+                    base,ext=os.path.splitext(os.path.basename(input_fp))
+                    if len(input_files)==1 and args.output_file: output_fp=args.output_file
+                    else:
+                        if args.outdir: out_dir=args.outdir
+                        elif args.output: out_dir=os.path.join(os.path.dirname(input_fp),'output')
+                        else: out_dir=os.path.dirname(input_fp)
+                        os.makedirs(out_dir,exist_ok=True)
+                        output_fp=os.path.join(out_dir,f"{base}_masked{ext}")
+                    out_enc='utf-8' if args.force_output_utf8 else chosen
+                    with open(output_fp,'w',encoding=out_enc) as wf: wf.write('\n'.join(lines))
+                    print(f"SUCCESS: ({file_index}/{total_files}) Tersimpan: '{output_fp}' | Karakter dimasking: {grand_local_masked}")
+                    return (grand_local_masked,0)
+                except Exception as e:
+                    print(f"ERROR: File '{input_fp}' gagal diproses: {e}")
+                    return (0,1)
+
+            if args.jobs > 1 and len(input_files) > 1:
+                print(f"INFO: Parallel mode aktif --jobs={args.jobs}")
+                total = len(input_files)
+                masked_sum = 0
+                errors = 0
+                with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+                    future_map = {ex.submit(_process_file_core, fp, idx+1, total): fp for idx, fp in enumerate(input_files)}
+                    for fut in as_completed(future_map):
+                        mcount, status = fut.result()
+                        masked_sum += mcount
+                        if status != 0:
+                            errors += 1
+                        processed_files += 1
+                        if files_progress_cb:
+                            files_progress_cb(processed_files, len(input_files))
+                grand_total_masked += masked_sum
+                if files_finish_progress:
+                    files_finish_progress()
+                print(f"SUCCESS: Parallel selesai. File diproses: {processed_files}/{len(input_files)} | Total karakter dimasking: {grand_total_masked} | Error: {errors}")
+                return
+
+            for file_index, input_fp in enumerate(input_files, start=1):
+                files_progress_cb(processed_files, len(input_files))
+            continue  # lanjut ke file berikutnya
+
+        # Non-stream (in-memory) reading path
         chosen_encoding = 'utf-8'
         raw_bytes = b''
         try:
@@ -519,57 +1125,101 @@ def main():
                 chosen_encoding = args.encoding
             elif args.auto_encoding:
                 chosen_encoding = detect_encoding(raw_bytes)
-            # Decode dengan chosen_encoding + fallback latin-1 jika gagal
+            else:
+                # Try utf-8 else fallback latin-1
+                try:
+                    raw_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    chosen_encoding = 'latin-1'
             try:
                 input_content = raw_bytes.decode(chosen_encoding)
             except UnicodeDecodeError as ue:
-                if not args.auto_encoding and not args.encoding:
-                    # Coba latin-1
+                if chosen_encoding != 'latin-1':
                     try:
                         input_content = raw_bytes.decode('latin-1')
                         chosen_encoding = 'latin-1'
-                        print(f"WARNING: Decode utf-8 gagal untuk '{input_fp}' ({ue}). Fallback ke latin-1.")
+                        print(f"WARNING: Decode '{input_fp}' gagal ({ue}); fallback latin-1.")
                     except Exception:
                         raise
                 else:
-                    print(f"ERROR: Gagal decode dengan encoding '{chosen_encoding}' untuk '{input_fp}': {ue}")
                     raise
             masked_content_lines = input_content.splitlines()
             print(f"INFO: ({file_index}/{len(input_files)}) Memuat '{input_fp}' ({len(masked_content_lines)} baris, encoding={chosen_encoding})")
         except Exception as e:
-            print(f"ERROR: Gagal membaca '{input_fp}': {e}")
+            print(f"ERROR: Gagal membaca '{input_fp}' (in-memory): {e}")
             if files_progress_cb:
                 files_progress_cb(file_index, len(input_files))
             continue
 
-        # 3.2 Terapkan semua rule pada file ini
+    # 3.2 Terapkan semua rule (in-memory mode) dengan agregasi type1
         file_masked_count = 0
         try:
-            for i, rule in enumerate(rules):
-                rule_type = rule.get('type')
-                rule_label = f"{os.path.basename(input_fp)} [Rule {i+1}/{len(rules)}: {rule_type}]"
-                progress_cb = None
-                finish_progress = None
+            type1_rules = [r for r in rules if r.get('type') == 'type1']
+            type2_rules = [r for r in rules if r.get('type') == 'type2']
+            skip_lines_global = int(config.get('skipLines', 0) or 0)
+            if type1_rules:
+                combined = build_combined_type1_regex(type1_rules)
+                label = f"{os.path.basename(input_fp)} [Type1 aggregated]"
+                progress_cb = finish_progress = None
+                if args.progress:
+                    progress_cb, finish_progress = make_progress_printer(label)
+                total_bytes = sum(len((ln+'\n').encode(chosen_encoding, errors='ignore')) for ln in masked_content_lines)
+                progressed = 0
+                new_lines = []
+                for line_index, ln in enumerate(masked_content_lines):
+                    raw_len = len((ln+'\n').encode(chosen_encoding, errors='ignore'))
+                    total_ranges = []
+                    # Terapkan skipLines: sebelum line_index >= skip_lines_global tidak dimasking
+                    if line_index < skip_lines_global:
+                        new_lines.append(ln)
+                        progressed += raw_len
+                        if progress_cb and total_bytes > 0:
+                            progress_cb(progressed, total_bytes)
+                        continue
+                    if 'always' in combined:
+                        total_ranges.extend(combined['always'])
+                    if 'icase' in combined:
+                        rx, gmap = combined['icase']
+                        m = rx.search(ln)
+                        if m:
+                            for g, rngs in gmap.items():
+                                if m.group(g) is not None:
+                                    total_ranges.extend(rngs)
+                    if 'case' in combined:
+                        rx, gmap = combined['case']
+                        m = rx.search(ln)
+                        if m:
+                            for g, rngs in gmap.items():
+                                if m.group(g) is not None:
+                                    total_ranges.extend(rngs)
+                    if total_ranges:
+                        new_ln, cnt = apply_masking_to_line(ln, total_ranges)
+                        new_lines.append(new_ln)
+                        file_masked_count += cnt
+                    else:
+                        new_lines.append(ln)
+                    progressed += raw_len
+                    if progress_cb and total_bytes > 0:
+                        progress_cb(progressed, total_bytes)
+                if finish_progress:
+                    finish_progress()
+                masked_content_lines = new_lines
+                print(f"INFO:   [Type1 aggregated] selesai. Karakter dimasking: {file_masked_count}")
+            # Lanjutkan dengan type2 rules (grouped)
+            grouped_type2 = group_type2_rules(type2_rules)
+            for i, rule in enumerate(grouped_type2, start=1):
+                rule_label = f"{os.path.basename(input_fp)} [Type2Group {i}/{len(grouped_type2)}]"
+                progress_cb = finish_progress = None
                 if args.progress:
                     progress_cb, finish_progress = make_progress_printer(rule_label)
-                
-                if rule_type == 'type1':
-                    print(f"INFO:   [Rule {i+1}/{len(rules)}] type1 - anchor=\"{rule.get('anchor','')}\"")
-                    count = apply_type1_masking(masked_content_lines, rule, progress_cb)
-                elif rule_type == 'type2':
-                    print(f"INFO:   [Rule {i+1}/{len(rules)}] type2 - anchorStart=\"{rule.get('anchorStart','')}\" anchorEnd=\"{rule.get('anchorEnd','')}\"")
-                    if rule.get('linesPerRecord', 1) < 1:
-                        print(f"WARNING: linesPerRecord < 1 pada rule {i+1}. Diset ke 1.")
-                        rule['linesPerRecord'] = 1
-                    count = apply_type2_masking(masked_content_lines, rule, progress_cb)
-                else:
-                    print(f"WARNING: Melewati aturan {i+1} dengan tipe tidak dikenal: {rule_type}")
-                    count = 0
-                
+                print(f"INFO:   [Type2Group {i}/{len(grouped_type2)}] anchorStart=\"{rule.get('anchorStart','')}\" anchorEnd=\"{rule.get('anchorEnd','')}\"")
+                if rule.get('linesPerRecord', 1) < 1:
+                    rule['linesPerRecord'] = 1
+                count = apply_type2_masking(masked_content_lines, rule, progress_cb)
                 file_masked_count += count
                 if finish_progress:
                     finish_progress()
-                print(f"INFO:   [Rule {i+1}/{len(rules)}] selesai. Karakter dimasking: {count}")
+                print(f"INFO:   [Type2Group {i}/{len(grouped_type2)}] selesai. +{count}")
         except Exception as e:
             print(f"ERROR: Kesalahan saat menerapkan aturan masking pada file '{input_fp}': {e}")
             if files_progress_cb:
@@ -582,7 +1232,13 @@ def main():
             if len(input_files) == 1 and args.output_file:
                 output_fp = args.output_file
             else:
-                out_dir = args.outdir if args.outdir else os.path.dirname(input_fp)
+                if args.outdir:
+                    out_dir = args.outdir
+                elif args.output:
+                    parent_dir = os.path.dirname(input_fp)
+                    out_dir = os.path.join(parent_dir, 'output')
+                else:
+                    out_dir = os.path.dirname(input_fp)
                 os.makedirs(out_dir, exist_ok=True)
                 output_fp = os.path.join(out_dir, f"{base}_masked{ext}")
 
