@@ -23,17 +23,14 @@ jobs:
         pip install pyinstaller
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-    - name: 🛠️ Build EXE with PyInstaller (Using --onedir)
+    - name: 🛠️ Build EXE with PyInstaller (Using --onedir & --windowed)
       run: |
-        # 🚨 PERUBAHAN UTAMA: Menggunakan --onedir untuk startup yang cepat
-        # Ini akan membuat folder 'filemask' di dalam dist/
-        pyinstaller --onedir --console filemask.py
+        # 🚨 PERBAIKAN UTAMA: Menggunakan --windowed (-w) untuk aplikasi GUI (tkinter)
+        # Serta --hidden-import viewer untuk memastikan modul di-bundle.
+        pyinstaller --onedir --windowed filemask.py --hidden-import large-file-viewer
 
     - name: 📤 Upload 'OneDir' Artifact Folder
       uses: actions/upload-artifact@v4 
       with:
-        # Nama artifact diubah untuk mencerminkan bahwa ini adalah folder
         name: filemask-onedir-bundle 
-        # Path diubah untuk mengunggah seluruh folder yang dibuat oleh PyInstaller
-        # Nama foldernya sama dengan nama script (filemask)
         path: dist/filemask
