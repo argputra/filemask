@@ -3,6 +3,13 @@ import json
 import re
 import argparse
 import os # Import modul os untuk manipulasi path
+import time
+import traceback
+import random
+import hashlib
+from datetime import datetime, timedelta
+# Mode masking global (di-set di main() dari argumen CLI)
+MASK_MODE = 'star'  # pilihan: 'star' (default), 'scramble'
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==============================================================================
@@ -139,23 +146,38 @@ def apply_masking_to_line(line: str, ranges: list[dict]) -> tuple[str, int]:
     HANYA karakter non-whitespace yang akan di-masking.
     """
     chars = list(line)
-    masked_count = 0
+    masked_indices = []  # indeks karakter (non-whitespace) yang akan dimasking
 
     for char_index in range(len(chars)):
-        is_masked = False
-        
         # Cek apakah posisi karakter masuk dalam rentang masking
+        in_range = False
         for pos in ranges:
-            if char_index >= pos['start'] and char_index <= pos['end']:
-                is_masked = True
+            if pos['start'] <= char_index <= pos['end']:
+                in_range = True
                 break
+        if in_range and not chars[char_index].isspace():
+            masked_indices.append(char_index)
 
-        # Terapkan masking jika di rentang posisi DAN bukan spasi (whitespace)
-        if is_masked and not chars[char_index].isspace():
-            chars[char_index] = '*'
-            masked_count += 1
+    # Tidak ada yang perlu dimasking
+    if not masked_indices:
+        return line, 0
 
-    return "".join(chars), masked_count
+    if MASK_MODE == 'scramble':
+        # Scramble mempertahankan multiset karakter, hanya mengacak urutannya.
+        # Deterministik: seed dari hash substring yang akan dimasking sehingga idempotent antar run.
+        segment_chars = [chars[i] for i in masked_indices]
+        seed_src = ''.join(segment_chars)
+        # Jika semua karakter sama (misal 'AAAA'), shuffle tidak mengubah – itu ok.
+        seed_int = int(hashlib.sha256(seed_src.encode('utf-8')).hexdigest(), 16) & 0xffffffff
+        rng = random.Random(seed_int)
+        rng.shuffle(segment_chars)
+        for idx, ci in enumerate(masked_indices):
+            chars[ci] = segment_chars[idx]
+    else:  # 'star'
+        for ci in masked_indices:
+            chars[ci] = '*'
+
+    return ''.join(chars), len(masked_indices)
 
 # ==============================================================================
 # 2. MASKING LOGIC
@@ -386,6 +408,10 @@ def main():
     parser.add_argument('--mode', choices=['auto','memory','stream'], default='auto',
                         help="Strategi pemrosesan: auto (default), memory (in-memory), atau stream (baris demi baris).")
 
+    # Opsi mode masking: bintang (*) atau scramble
+    parser.add_argument('--mask-mode', choices=['star','scramble'], default='star',
+                        help="Cara masking karakter di posisi yang ditarget: 'star' (default, ganti '*') atau 'scramble' (acak urutan karakter asli).")
+
     # Opsi progress bar di terminal
     parser.add_argument('--progress', action='store_true', help='Tampilkan progress bar saat memproses')
     parser.add_argument('--progress-style', choices=['auto','simple','rich'], default='auto',
@@ -398,6 +424,8 @@ def main():
         sys.exit(1)
 
     args = parser.parse_args()
+    global MASK_MODE
+    MASK_MODE = args.mask_mode
     
     # Helper: deteksi apakah path mengandung wildcard
     def has_glob(p: str) -> bool:
@@ -479,6 +507,24 @@ def main():
         print("ERROR: Tidak ada file input yang akan diproses setelah filter.")
         sys.exit(1)
 
+    # Exclude otomatis: abaikan file yang sudah hasil masking (mengandung pola baru atau legacy)
+    before_excl = len(input_files)
+    excl_patterns = ['_mask_', '_masked']
+    filtered = []
+    excluded = []
+    for p in input_files:
+        base_lower = os.path.basename(p).lower()
+        if any(pat in base_lower for pat in excl_patterns):
+            excluded.append(p)
+        else:
+            filtered.append(p)
+    input_files = filtered
+    if excluded:
+        print(f"INFO: {len(excluded)} file diabaikan karena mengandung pola {excl_patterns} (hasil masking).")
+    if not input_files:
+        print("ERROR: Setelah eksklusi pola masking tidak ada file yang tersisa untuk diproses.")
+        sys.exit(1)
+
     if multi_mode and args.output_file:
         print("WARNING: output_file diabaikan dalam mode multi-file. Gunakan --outdir untuk menentukan folder output.")
 
@@ -516,7 +562,6 @@ def main():
                 use_rich = True  # akan fallback jika import gagal
         if use_rich:
             try:
-                import time
                 import importlib
                 rp = importlib.import_module('rich.progress')
                 Progress = getattr(rp, 'Progress')
@@ -576,15 +621,31 @@ def main():
         # Simple progress (ANSI teks)
         is_tty = sys.stdout.isatty()
         bar_width = 40
+        start_time = time.time()
+
+        def _fmt_hms(seconds: float) -> str:
+            seconds = max(0, int(seconds))
+            h = seconds // 3600
+            m = (seconds % 3600) // 60
+            s = seconds % 60
+            return f"{h:02d}:{m:02d}:{s:02d}"
 
         def _print(current: int, total: int):
             if total <= 0:
                 return
             ratio = max(0.0, min(1.0, current / total))
             filled = int(ratio * bar_width)
-            bar = '[' + ('#' * filled) + ('-' * (bar_width - filled)) + ']'
+            bar = '[' + ('█' * filled) + ('-' * (bar_width - filled)) + ']'
             pct = f"{ratio * 100:5.1f}%"
-            line = f"{label} {bar} {pct} ({current}/{total})"
+            elapsed = time.time() - start_time
+            speed = (current / elapsed) if elapsed > 0 else 0.0
+            eta = ((total - current) / speed) if speed > 0 else None
+            eta_str = _fmt_hms(eta) if eta is not None else "--:--:--"
+            elp_str = _fmt_hms(elapsed)
+            line = (
+                f"{label} {bar} {pct} ({current}/{total}) "
+                f"| elp {elp_str} | eta {eta_str} | {speed:6.1f} it/s"
+            )
             # Gunakan carriage return untuk update baris yang sama jika TTY
             if is_tty:
                 sys.stdout.write('\r' + line)
@@ -614,7 +675,29 @@ def main():
         # Inisialisasi ke 0 dari total
         files_progress_cb(0, len(input_files))
     
+    # Catat waktu mulai keseluruhan
+    overall_start_ts = time.time()
+    overall_start_dt = datetime.now()
+    print(f"INFO: Proses dimulai pada: {overall_start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print("INFO: Memulai proses masking...")
+    # Helper nama file output baru
+    def build_output_filename(src_path: str, out_dir: str) -> str:
+        base, ext = os.path.splitext(os.path.basename(src_path))
+        ts = datetime.now().strftime('%y%m%d_%H%M%S')
+        return os.path.join(out_dir, f"{base}_mask_{ts}{ext}")
+
+    # Helper pemindahan file yang aman antar device (fallback copy+remove jika EXDEV)
+    def safe_replace(src: str, dst: str):
+        try:
+            os.replace(src, dst)
+        except OSError as e:
+            # 18 = EXDEV (cross-device link), fallback ke copy
+            if getattr(e, 'errno', None) == 18:
+                import shutil
+                shutil.copyfile(src, dst)
+                os.remove(src)
+            else:
+                raise
     processed_files = 0
     for file_index, input_fp in enumerate(input_files, start=1):
     # 3.1 Baca / proses file input (pilih streaming atau in-memory)
@@ -877,7 +960,7 @@ def main():
                 else:
                     out_dir = os.path.dirname(input_fp)
                 os.makedirs(out_dir, exist_ok=True)
-                output_fp = os.path.join(out_dir, f"{base}_masked{ext}")
+                output_fp = build_output_filename(input_fp, out_dir)
             # Pindahkan hasil akhir (working_path sekarang file temp terakhir)
             try:
                 # Pastikan jika working_path adalah file asli (tidak ada rule) kita tetap salin
@@ -887,7 +970,7 @@ def main():
                         for line in r:
                             w.write(line)
                 else:
-                    os.replace(working_path, output_fp)
+                    safe_replace(working_path, output_fp)
                 print(f"SUCCESS: ({file_index}/{len(input_files)}) Tersimpan (stream): '{output_fp}' | Karakter dimasking: {file_masked_count}")
                 grand_total_masked += file_masked_count
             except Exception as e:
@@ -1023,8 +1106,8 @@ def main():
                             elif args.output: out_dir=os.path.join(os.path.dirname(input_fp),'output')
                             else: out_dir=os.path.dirname(input_fp)
                             os.makedirs(out_dir,exist_ok=True)
-                            output_fp=os.path.join(out_dir,f"{base}_masked{ext}")
-                        if working_path!=input_fp: os.replace(working_path,output_fp)
+                            output_fp=build_output_filename(input_fp,out_dir)
+                        if working_path!=input_fp: safe_replace(working_path,output_fp)
                         else:
                             with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(output_fp,'w',encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wf:
                                 for line in rf: wf.write(line)
@@ -1081,7 +1164,7 @@ def main():
                         elif args.output: out_dir=os.path.join(os.path.dirname(input_fp),'output')
                         else: out_dir=os.path.dirname(input_fp)
                         os.makedirs(out_dir,exist_ok=True)
-                        output_fp=os.path.join(out_dir,f"{base}_masked{ext}")
+                        output_fp=build_output_filename(input_fp,out_dir)
                     out_enc='utf-8' if args.force_output_utf8 else chosen
                     with open(output_fp,'w',encoding=out_enc) as wf: wf.write('\n'.join(lines))
                     print(f"SUCCESS: ({file_index}/{total_files}) Tersimpan: '{output_fp}' | Karakter dimasking: {grand_local_masked}")
@@ -1109,6 +1192,15 @@ def main():
                 if files_finish_progress:
                     files_finish_progress()
                 print(f"SUCCESS: Parallel selesai. File diproses: {processed_files}/{len(input_files)} | Total karakter dimasking: {grand_total_masked} | Error: {errors}")
+                overall_end_dt = datetime.now()
+                total_secs = time.time() - overall_start_ts
+                # Laporkan waktu selesai dan total durasi
+                print(f"INFO: Waktu selesai: {overall_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                # Format durasi HH:MM:SS
+                h = int(total_secs) // 3600
+                m = (int(total_secs) % 3600) // 60
+                s = int(total_secs) % 60
+                print(f"INFO: Total durasi: {h:02d}:{m:02d}:{s:02d}")
                 return
 
             for file_index, input_fp in enumerate(input_files, start=1):
@@ -1240,7 +1332,7 @@ def main():
                 else:
                     out_dir = os.path.dirname(input_fp)
                 os.makedirs(out_dir, exist_ok=True)
-                output_fp = os.path.join(out_dir, f"{base}_masked{ext}")
+                output_fp = build_output_filename(input_fp, out_dir)
 
             final_masked_content = '\n'.join(masked_content_lines)
             out_encoding = 'utf-8' if args.force_output_utf8 else chosen_encoding
@@ -1259,6 +1351,31 @@ def main():
         files_finish_progress()
 
     print(f"SUCCESS: Selesai. File diproses: {processed_files}/{len(input_files)} | Total karakter dimasking: {grand_total_masked}")
+    overall_end_dt = datetime.now()
+    total_secs = time.time() - overall_start_ts
+    print(f"INFO: Waktu selesai: {overall_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    h = int(total_secs) // 3600
+    m = (int(total_secs) % 3600) // 60
+    s = int(total_secs) % 60
+    print(f"INFO: Total durasi: {h:02d}:{m:02d}:{s:02d}")
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SystemExit:
+        # biarkan sys.exit berjalan normal
+        raise
+    except Exception:
+        err = traceback.format_exc()
+        # Tampilkan ke stderr agar PyInstaller tidak menyembunyikan penyebab aslinya
+        print("FATAL: Unhandled exception: ", file=sys.stderr)
+        print(err, file=sys.stderr)
+        # Simpan ke file log di CWD untuk investigasi lebih lanjut
+        try:
+            log_path = os.path.join(os.getcwd(), f"filemask_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+            with open(log_path, 'w', encoding='utf-8') as lf:
+                lf.write(err)
+            print(f"FATAL: Traceback disimpan ke: {log_path}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
