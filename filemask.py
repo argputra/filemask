@@ -635,10 +635,15 @@ def main():
                 # Fallback ke simple jika rich tidak tersedia/bermasalah
                 pass
 
-        # Simple progress (ANSI teks)
+        # Simple progress (ANSI teks), dengan penyesuaian Windows agar tetap satu baris
         is_tty = sys.stdout.isatty()
-        bar_width = 40
         start_time = time.time()
+        is_windows = (os.name == 'nt')
+        # Gunakan ASCII di Windows untuk menghindari lebar unicode blok
+        bar_fill_char = '#' if is_windows else '█'
+        bar_empty_char = '-' if not is_windows else '-'
+        # Track panjang sebelumnya agar bisa menghapus sisa karakter
+        prev_len = 0
 
         def _fmt_hms(seconds: float) -> str:
             seconds = max(0, int(seconds))
@@ -648,25 +653,55 @@ def main():
             return f"{h:02d}:{m:02d}:{s:02d}"
 
         def _print(current: int, total: int):
+            nonlocal prev_len
             if total <= 0:
                 return
+            # Hitung lebar terminal agar tidak wrap ke baris berikutnya (terutama di Windows)
+            try:
+                import shutil
+                term_cols = shutil.get_terminal_size(fallback=(80, 20)).columns
+            except Exception:
+                term_cols = 80
+
             ratio = max(0.0, min(1.0, current / total))
-            filled = int(ratio * bar_width)
-            bar = '[' + ('█' * filled) + ('-' * (bar_width - filled)) + ']'
             pct = f"{ratio * 100:5.1f}%"
             elapsed = time.time() - start_time
             speed = (current / elapsed) if elapsed > 0 else 0.0
             eta = ((total - current) / speed) if speed > 0 else None
             eta_str = _fmt_hms(eta) if eta is not None else "--:--:--"
             elp_str = _fmt_hms(elapsed)
-            line = (
-                f"{label} {bar} {pct} ({current}/{total}) "
-                f"| elp {elp_str} | eta {eta_str} | {speed:6.1f} it/s"
-            )
+            # Bagian teks non-bar
+            suffix = f" {pct} ({current}/{total}) | elp {elp_str} | eta {eta_str} | {speed:6.1f} it/s"
+            # Usahakan tetap satu baris: alokasikan bar_width berdasarkan lebar terminal
+            max_cols = max(20, term_cols - 1)  # sisakan 1 kolom
+            # Jika label terlalu panjang, potong
+            max_label = 30 if max_cols > 60 else 12
+            disp_label = (label if len(label) <= max_label else (label[:max_label - 1] + '…'))
+            # Hitung lebar bar yang memungkinkan
+            reserved = len(disp_label) + 1 + 2 + len(suffix)  # label + sp + [] + suffix
+            bar_width = max(10, max_cols - reserved)
+            # Bangun bar
+            filled = int(ratio * bar_width)
+            if filled > bar_width:
+                filled = bar_width
+            bar = '[' + (bar_fill_char * filled) + (bar_empty_char * (bar_width - filled)) + ']'
+            line = f"{disp_label} {bar}{suffix}"
+            # Jika masih kepanjangan, kurangi lagi bar
+            if len(line) > max_cols:
+                over = len(line) - max_cols
+                bar_width = max(5, bar_width - over)
+                filled = int(ratio * bar_width)
+                if filled > bar_width:
+                    filled = bar_width
+                bar = '[' + (bar_fill_char * filled) + (bar_empty_char * (bar_width - filled)) + ']'
+                line = f"{disp_label} {bar}{suffix}"
             # Gunakan carriage return untuk update baris yang sama jika TTY
             if is_tty:
-                sys.stdout.write('\r' + line)
+                # Hapus sisa dari update sebelumnya dengan padding spasi
+                clear_tail = ' ' * max(0, prev_len - len(line))
+                sys.stdout.write('\r' + line + clear_tail)
                 sys.stdout.flush()
+                prev_len = len(line)
             else:
                 # Jika bukan TTY (misal dialihkan ke file), print ringkas
                 if current == total:
@@ -674,6 +709,12 @@ def main():
 
         def _finish():
             # Pastikan baris baru setelah progress selesai
+            try:
+                # Tulis CR sekali lagi agar tampilan final rapi, lalu newline
+                sys.stdout.write('\r')
+                sys.stdout.write('')
+            except Exception:
+                pass
             sys.stdout.write('\n')
             sys.stdout.flush()
 
