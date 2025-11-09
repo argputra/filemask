@@ -383,10 +383,13 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    # Argumen: config opsional, input path wajib (file|folder|wildcard)
+    # Argumen: config opsional, input path (file|folder|wildcard) atau mode viewer
     parser.add_argument('--config', dest='config_file', nargs='?', default=None,
                         help="Path ke file konfigurasi JSON. Jika tidak diberikan: akan dicari .json dalam folder input.")
-    parser.add_argument('input_path', help="Path input: file, folder, atau wildcard (cth: ./data/*.txt atau Dat*)")
+    parser.add_argument('input_path', nargs='?', default=None,
+                        help="Path input: file, folder, atau wildcard (cth: ./data/*.txt atau Dat*). Opsional jika menggunakan --viewer.")
+    parser.add_argument('--viewer', nargs='?', const='', metavar='FILE',
+                        help="Buka GUI Large File Viewer. Opsional berikan FILE awal untuk langsung dibuka.")
     
     # Output: untuk single file bisa pakai positional output_file; untuk multi-file pakai --outdir
     parser.add_argument('output_file', nargs='?', default=None, 
@@ -424,6 +427,17 @@ def main():
         sys.exit(1)
 
     args = parser.parse_args()
+
+    # Mode viewer: buka large_file_viewer dan keluar
+    if args.viewer is not None:
+        try:
+            from large_file_viewer import launch_viewer
+        except ImportError as e:
+            print(f"ERROR: Modul viewer tidak ditemukan: {e}")
+            sys.exit(1)
+        initial = args.viewer if args.viewer else None
+        launch_viewer(initial)
+        return
     global MASK_MODE
     MASK_MODE = args.mask_mode
     
@@ -433,6 +447,9 @@ def main():
 
     # Kumpulkan daftar file input berdasarkan input_path
     input_candidates = []
+    if args.input_path is None:
+        print("ERROR: input_path wajib kecuali menggunakan --viewer. Lihat --help untuk contoh.")
+        sys.exit(1)
     in_path = args.input_path
     if has_glob(in_path):
         import glob
