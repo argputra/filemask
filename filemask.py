@@ -421,6 +421,8 @@ def main():
                         help='Gaya progress bar: auto (default, pakai rich jika tersedia), simple, atau rich')
     parser.add_argument('--jobs', type=int, default=1,
                         help='Jumlah file yang diproses paralel (default 1). Nonaktifkan progress per-file saat >1.')
+    parser.add_argument('--sample', type=int, default=None,
+                        help='Hanya keluarkan N baris pertama dari hasil masking (sampling output).')
 
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
@@ -905,15 +907,16 @@ def main():
 
         # Tentukan mode efektif
         effective_mode = args.mode
-        if args.stream and args.mode == 'auto':
+        # Jika --sample aktif, paksa memory mode agar bisa potong N baris awal dengan mudah dan cepat
+        if args.sample is not None and args.sample > 0:
+            effective_mode = 'memory'
+        elif args.stream and args.mode == 'auto':
             effective_mode = 'stream'
         if effective_mode == 'auto':
             try:
                 fsize = os.path.getsize(input_fp)
             except Exception:
                 fsize = 0
-            type1_rules_all = [r for r in rules if r.get('type') == 'type1']
-            # Heuristik sederhana: besar atau banyak aturan -> stream
             if fsize > 512 * 1024 * 1024 or len(rules) >= 50:
                 effective_mode = 'stream'
             else:
@@ -1021,14 +1024,23 @@ def main():
                 output_fp = build_output_filename(input_fp, out_dir)
             # Pindahkan hasil akhir (working_path sekarang file temp terakhir)
             try:
-                # Pastikan jika working_path adalah file asli (tidak ada rule) kita tetap salin
-                if working_path == input_fp:
-                    # Tidak ada perubahan atau tidak ada rule
-                    with open(working_path, 'r', encoding=chosen_encoding, errors='replace') as r, open(output_fp, 'w', encoding=( 'utf-8' if args.force_output_utf8 else chosen_encoding)) as w:
-                        for line in r:
+                # Tulis hasil akhir; jika sample aktif, hanya tulis N baris pertama
+                out_enc = ('utf-8' if args.force_output_utf8 else chosen_encoding)
+                if args.sample is not None and args.sample > 0:
+                    with open(working_path, 'r', encoding=chosen_encoding, errors='replace') as r, open(output_fp, 'w', encoding=out_enc) as w:
+                        for i, line in enumerate(r, start=1):
+                            if i > args.sample:
+                                break
                             w.write(line)
+                    print(f"INFO: Sample mode aktif (--sample {args.sample}): hanya menulis {args.sample} baris pertama.")
                 else:
-                    safe_replace(working_path, output_fp)
+                    # Pastikan jika working_path adalah file asli (tidak ada rule) kita tetap salin
+                    if working_path == input_fp:
+                        with open(working_path, 'r', encoding=chosen_encoding, errors='replace') as r, open(output_fp, 'w', encoding=out_enc) as w:
+                            for line in r:
+                                w.write(line)
+                    else:
+                        safe_replace(working_path, output_fp)
                 print(f"SUCCESS: ({file_index}/{len(input_files)}) Tersimpan (stream): '{output_fp}' | Karakter dimasking: {file_masked_count}")
                 grand_total_masked += file_masked_count
             except Exception as e:
@@ -1165,10 +1177,19 @@ def main():
                             else: out_dir=os.path.dirname(input_fp)
                             os.makedirs(out_dir,exist_ok=True)
                             output_fp=build_output_filename(input_fp,out_dir)
-                        if working_path!=input_fp: safe_replace(working_path,output_fp)
+                        # Tulis output dengan dukungan --sample
+                        out_enc = ('utf-8' if args.force_output_utf8 else chosen_encoding)
+                        if args.sample is not None and args.sample > 0:
+                            with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(output_fp,'w',encoding=out_enc) as wf:
+                                for i, line in enumerate(rf, start=1):
+                                    if i>args.sample: break
+                                    wf.write(line)
+                            print(f"INFO: Sample mode aktif (--sample {args.sample}): hanya menulis {args.sample} baris pertama.")
                         else:
-                            with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(output_fp,'w',encoding=('utf-8' if args.force_output_utf8 else chosen_encoding)) as wf:
-                                for line in rf: wf.write(line)
+                            if working_path!=input_fp: safe_replace(working_path,output_fp)
+                            else:
+                                with open(working_path,'r',encoding=chosen_encoding,errors='replace') as rf, open(output_fp,'w',encoding=out_enc) as wf:
+                                    for line in rf: wf.write(line)
                         print(f"SUCCESS: ({file_index}/{total_files}) Tersimpan (stream): '{output_fp}' | Karakter dimasking: {file_masked_count}")
                         grand_local_masked=file_masked_count
                         # cleanup temps
@@ -1183,13 +1204,32 @@ def main():
                             except Exception: pass
                         return (grand_local_masked,0)
                     # memory mode
-                    with open(input_fp,'rb') as bf: raw=bf.read()
-                    chosen='utf-8'
-                    if args.encoding: chosen=args.encoding
+                    # Sample processing: baca hanya N baris pertama bila diminta
+                    if args.sample is not None and args.sample > 0:
+                        # deteksi encoding sederhana
+                        with open(input_fp,'rb') as bf: head = bf.read(65536)
+                        def _detect(data: bytes) -> str:
+                            if data.startswith(b'\xff\xfe'): return 'utf-16-le'
+                            if data.startswith(b'\xfe\xff'): return 'utf-16-be'
+                            if data.startswith(b'\xef\xbb\xbf'): return 'utf-8-sig'
+                            try: data.decode('utf-8'); return 'utf-8'
+                            except UnicodeDecodeError: return 'latin-1'
+                        chosen = args.encoding or _detect(head)
+                        with open(input_fp,'r',encoding=chosen,errors='replace') as rf:
+                            lines=[]
+                            for i, ln in enumerate(rf, start=1):
+                                lines.append(ln.rstrip('\n'))
+                                if i>=args.sample: break
+                        print(f"INFO: Sample processing aktif: hanya MEMPROSES {args.sample} baris pertama dari '{input_fp}'.")
                     else:
-                        try: raw.decode('utf-8')
-                        except UnicodeDecodeError: chosen='latin-1'
-                    content=raw.decode(chosen,'replace'); lines=content.splitlines(); print(f"INFO: ({file_index}/{total_files}) Memuat '{input_fp}' ({len(lines)} baris, encoding={chosen})")
+                        with open(input_fp,'rb') as bf: raw=bf.read()
+                        chosen='utf-8'
+                        if args.encoding: chosen=args.encoding
+                        else:
+                            try: raw.decode('utf-8')
+                            except UnicodeDecodeError: chosen='latin-1'
+                        content=raw.decode(chosen,'replace'); lines=content.splitlines()
+                    print(f"INFO: ({file_index}/{total_files}) Memuat '{input_fp}' ({len(lines)} baris, encoding={chosen})")
                     type1_rules=[r for r in rules if r.get('type')=='type1']
                     type2_rules=[r for r in rules if r.get('type')=='type2']
                     if type1_rules:
@@ -1269,8 +1309,29 @@ def main():
         chosen_encoding = 'utf-8'
         raw_bytes = b''
         try:
-            with open(input_fp, 'rb') as bf:
-                raw_bytes = bf.read()
+            # Jika sample aktif, baca N baris pertama saja untuk mempercepat
+            if args.sample is not None and args.sample > 0:
+                # Deteksi encoding cepat dengan head bytes lalu baca line-wise
+                with open(input_fp, 'rb') as bf:
+                    head = bf.read(65536)
+                def _detect(data: bytes) -> str:
+                    if data.startswith(b'\xff\xfe'): return 'utf-16-le'
+                    if data.startswith(b'\xfe\xff'): return 'utf-16-be'
+                    if data.startswith(b'\xef\xbb\xbf'): return 'utf-8-sig'
+                    try: data.decode('utf-8'); return 'utf-8'
+                    except UnicodeDecodeError: return 'latin-1'
+                chosen_encoding = args.encoding or (_detect(head) if args.auto_encoding else ('utf-8' if not head or _detect(head)=='utf-8' else 'latin-1'))
+                collected = []
+                with open(input_fp, 'r', encoding=chosen_encoding, errors='replace') as rf:
+                    for i, line in enumerate(rf, start=1):
+                        collected.append(line.rstrip('\n'))
+                        if i >= args.sample:
+                            break
+                masked_content_lines = collected
+                print(f"INFO: Sample processing aktif: hanya MEMPROSES {args.sample} baris pertama dari '{input_fp}'.")
+            else:
+                with open(input_fp, 'rb') as bf:
+                    raw_bytes = bf.read()
             if args.encoding:
                 chosen_encoding = args.encoding
             elif args.auto_encoding:
@@ -1281,19 +1342,20 @@ def main():
                     raw_bytes.decode('utf-8')
                 except UnicodeDecodeError:
                     chosen_encoding = 'latin-1'
-            try:
-                input_content = raw_bytes.decode(chosen_encoding)
-            except UnicodeDecodeError as ue:
-                if chosen_encoding != 'latin-1':
-                    try:
-                        input_content = raw_bytes.decode('latin-1')
-                        chosen_encoding = 'latin-1'
-                        print(f"WARNING: Decode '{input_fp}' gagal ({ue}); fallback latin-1.")
-                    except Exception:
+            if args.sample is None or args.sample <= 0:
+                try:
+                    input_content = raw_bytes.decode(chosen_encoding)
+                except UnicodeDecodeError as ue:
+                    if chosen_encoding != 'latin-1':
+                        try:
+                            input_content = raw_bytes.decode('latin-1')
+                            chosen_encoding = 'latin-1'
+                            print(f"WARNING: Decode '{input_fp}' gagal ({ue}); fallback latin-1.")
+                        except Exception:
+                            raise
+                    else:
                         raise
-                else:
-                    raise
-            masked_content_lines = input_content.splitlines()
+                masked_content_lines = input_content.splitlines()
             print(f"INFO: ({file_index}/{len(input_files)}) Memuat '{input_fp}' ({len(masked_content_lines)} baris, encoding={chosen_encoding})")
         except Exception as e:
             print(f"ERROR: Gagal membaca '{input_fp}' (in-memory): {e}")
@@ -1357,6 +1419,8 @@ def main():
                 print(f"INFO:   [Type1 aggregated] selesai. Karakter dimasking: {file_masked_count}")
             # Lanjutkan dengan type2 rules (grouped)
             grouped_type2 = group_type2_rules(type2_rules)
+            if args.sample is not None and args.sample > 0:
+                print("WARNING: Sample processing aktif: Rule type2 mungkin tidak komplit jika anchor berada di luar N baris pertama.")
             for i, rule in enumerate(grouped_type2, start=1):
                 rule_label = f"{os.path.basename(input_fp)} [Type2Group {i}/{len(grouped_type2)}]"
                 progress_cb = finish_progress = None
